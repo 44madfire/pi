@@ -6,13 +6,22 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
+	AvailableCommand,
 	ClientContext,
+	NewSessionResponse,
 	RequestPermissionRequest,
 	RequestPermissionResponse,
+	SessionConfigOption,
 	SessionUpdate,
 	StopReason,
 } from "@agentclientprotocol/sdk/experimental/v2";
-import { client, methods, PROTOCOL_VERSION, ToolCallContent } from "@agentclientprotocol/sdk/experimental/v2";
+import {
+	client,
+	methods,
+	PROTOCOL_VERSION,
+	SessionConfigOption as SessionConfigOptionGuard,
+	ToolCallContent,
+} from "@agentclientprotocol/sdk/experimental/v2";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { applyPatch } from "diff";
@@ -21,8 +30,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.ts";
 import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { ToolCallEvent, ToolCallEventResult } from "../src/core/extensions/index.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { createAcpApp } from "../src/modes/acp/acp-mode.ts";
-import { createHarness, type Harness } from "./suite/harness.ts";
+import { createHarness, getMessageText, type Harness } from "./suite/harness.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 type UpdateOf<T extends SessionUpdate["sessionUpdate"]> = Extract<SessionUpdate, { sessionUpdate: T }>;
 
@@ -54,10 +65,13 @@ async function startScenario(options: {
 	approveAll?: boolean;
 	onPermission?: (request: RequestPermissionRequest) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
 	permissionRequests?: RequestPermissionRequest[];
+	harnessOptions?: Parameters<typeof createHarness>[0];
+	newResponse?: (response: NewSessionResponse) => void;
 }): Promise<Scenario> {
 	let gateHook: ((sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>) | undefined;
 	const harness = await createHarness({
 		tools: options.tools,
+		...options.harnessOptions,
 		extensionFactories: [
 			{
 				name: "acp-gate-test",
@@ -105,6 +119,7 @@ async function startScenario(options: {
 		info: { name: "test", version: "0.0.0" },
 	});
 	const created = await ctx.request(methods.agent.session.new, { cwd: harness.tempDir });
+	options.newResponse?.(created);
 	return {
 		harness,
 		ctx,
@@ -317,7 +332,7 @@ describe("acp mode", () => {
 			sessionId: scenario.sessionId,
 			cwd: scenario.harness.tempDir,
 		});
-		expect(resumed).toEqual({});
+		expect(resumed.configOptions?.map((option) => option.configId)).toEqual(["model", "thought_level"]);
 
 		await scenario.ctx.request(methods.agent.session.close, { sessionId: scenario.sessionId });
 		await expect(
@@ -820,5 +835,186 @@ describe("acp resume replay", () => {
 				replayFrom: { type: "_custom" },
 			}),
 		).rejects.toThrow();
+	});
+});
+
+function selectValues(option: SessionConfigOption): string[] {
+	if (!SessionConfigOptionGuard.isSelect(option)) throw new Error(`expected select, got ${option.type}`);
+	return option.options.map((entry) => ("options" in entry ? entry.groupId : entry.value));
+}
+
+function selectCurrent(option: SessionConfigOption): string {
+	if (!SessionConfigOptionGuard.isSelect(option)) throw new Error(`expected select, got ${option.type}`);
+	return option.currentValue;
+}
+
+async function waitForConfigUpdate(updates: SessionUpdate[], skip = 0): Promise<SessionConfigOption[]> {
+	for (let i = 0; i < 100; i++) {
+		const update = filterUpdates(updates, "config_option_update").at(skip);
+		if (update !== undefined) return update.configOptions;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error("timed out waiting for config_option_update");
+}
+
+describe("acp config options and commands", () => {
+	const stops: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		while (stops.length > 0) {
+			await stops.pop()?.();
+		}
+	});
+
+	it("returns model and thought_level config options on session/new", async () => {
+		let created: NewSessionResponse | undefined;
+		const scenario = await startScenario({
+			responses: [],
+			harnessOptions: { models: [{ id: "faux-1", name: "One", reasoning: true }] },
+			newResponse: (response) => {
+				created = response;
+			},
+		});
+		stops.push(scenario.stop);
+
+		const options = created?.configOptions;
+		if (options === undefined) throw new Error("expected configOptions on session/new");
+		expect(options.map((option) => option.configId)).toEqual(["model", "thought_level"]);
+		const [model, thought] = options;
+		if (model === undefined || thought === undefined) throw new Error("expected two config options");
+		expect(model.category).toBe("model");
+		expect(selectCurrent(model)).toBe("faux/faux-1");
+		expect(selectValues(model)).toEqual(["faux/faux-1"]);
+		expect(thought.category).toBe("thought_level");
+		expect(selectCurrent(thought)).toBe(scenario.harness.session.thinkingLevel);
+		expect(selectValues(thought)).toEqual(scenario.harness.session.getAvailableThinkingLevels());
+	});
+
+	it("sets thought_level, refreshes model levels, and rejects invalid values", async () => {
+		const scenario = await startScenario({
+			responses: [],
+			harnessOptions: {
+				models: [
+					{ id: "faux-1", name: "One", reasoning: true },
+					{ id: "faux-2", name: "Two", reasoning: false },
+				],
+			},
+		});
+		stops.push(scenario.stop);
+
+		const set = await scenario.ctx.request(methods.agent.session.setConfigOption, {
+			sessionId: scenario.sessionId,
+			configId: "thought_level",
+			type: "id",
+			value: "low",
+		});
+		const thought = set.configOptions.find((option) => option.configId === "thought_level");
+		if (thought === undefined) throw new Error("expected thought_level in response");
+		expect(selectCurrent(thought)).toBe("low");
+		expect(scenario.harness.session.thinkingLevel).toBe("low");
+
+		const switched = await scenario.ctx.request(methods.agent.session.setConfigOption, {
+			sessionId: scenario.sessionId,
+			configId: "model",
+			type: "id",
+			value: "faux/faux-2",
+		});
+		const model = switched.configOptions.find((option) => option.configId === "model");
+		const clamped = switched.configOptions.find((option) => option.configId === "thought_level");
+		if (model === undefined || clamped === undefined) throw new Error("expected model and thought_level");
+		expect(selectCurrent(model)).toBe("faux/faux-2");
+		expect(selectValues(clamped)).toEqual(["off"]);
+		expect(selectCurrent(clamped)).toBe("off");
+
+		await expect(
+			scenario.ctx.request(methods.agent.session.setConfigOption, {
+				sessionId: scenario.sessionId,
+				configId: "thought_level",
+				type: "id",
+				value: "ultra",
+			}),
+		).rejects.toThrow();
+		await expect(
+			scenario.ctx.request(methods.agent.session.setConfigOption, {
+				sessionId: scenario.sessionId,
+				configId: "mode",
+				type: "id",
+				value: "x",
+			}),
+		).rejects.toThrow();
+	});
+
+	it("emits config_option_update when the model changes elsewhere", async () => {
+		const scenario = await startScenario({
+			responses: [],
+			harnessOptions: {
+				models: [
+					{ id: "faux-1", name: "One", reasoning: true },
+					{ id: "faux-2", name: "Two", reasoning: false },
+				],
+			},
+		});
+		stops.push(scenario.stop);
+		scenario.harness.session.setThinkingLevel("high");
+		await waitForConfigUpdate(scenario.updates);
+		const seen = filterUpdates(scenario.updates, "config_option_update").length;
+
+		const model = scenario.harness.getModel("faux-2");
+		if (model === undefined) throw new Error("expected faux-2");
+		await scenario.harness.session.setModel(model);
+
+		// Updates deliver async, so wait for a new one past the high-level update.
+		const options = await waitForConfigUpdate(scenario.updates, seen);
+		const current = options.find((option) => option.configId === "model");
+		if (current === undefined) throw new Error("expected model option");
+		expect(selectCurrent(current)).toBe("faux/faux-2");
+	});
+
+	it("advertises a prompt template and executes it through prompt", async () => {
+		const resourceLoader = {
+			...createTestResourceLoader(),
+			getPrompts: () => ({
+				prompts: [
+					{
+						name: "review",
+						description: "Review template",
+						argumentHint: "<file>",
+						content: "Review this code: $1",
+						filePath: "/virtual/review.md",
+						sourceInfo: createSyntheticSourceInfo("/virtual/review.md", { source: "local" }),
+					},
+				],
+				diagnostics: [],
+			}),
+		};
+		let commands: AvailableCommand[] | undefined;
+		const scenario = await startScenario({
+			responses: [],
+			harnessOptions: { resourceLoader },
+			newResponse: (response) => {
+				commands = response.availableCommands;
+			},
+		});
+		stops.push(scenario.stop);
+		if (commands === undefined) throw new Error("expected availableCommands on session/new");
+		expect(commands).toContainEqual({
+			name: "review",
+			description: "Review template",
+			input: { type: "text", hint: "<file>" },
+		});
+
+		let expanded = "";
+		scenario.harness.setResponses([
+			(context) => {
+				const user = context.messages.find((message) => message.role === "user");
+				expanded = user === undefined ? "" : getMessageText(user);
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		await scenario.ctx.request(methods.agent.session.prompt, {
+			sessionId: scenario.sessionId,
+			prompt: [{ type: "text", text: "/review src/index.ts" }],
+		});
+		expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+		expect(expanded).toBe("Review this code: src/index.ts");
 	});
 });
