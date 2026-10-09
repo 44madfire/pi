@@ -17,6 +17,9 @@
  * - Text and thinking stream as `agent_message_chunk`/`agent_thought_chunk`
  *   keyed by a stable message id per assistant message; tool calls become
  *   `tool_call_update`s with text output.
+ * - Tool calls are gated through `session/request_permission` (PR3): reads run
+ *   free, edits and commands ask, and the tool card appears only after the
+ *   gate decides. `--approve-all` bypasses the gate.
  */
 
 import { Readable } from "node:stream";
@@ -24,6 +27,8 @@ import type {
 	AgentApp,
 	AgentContext,
 	ContentBlock,
+	PermissionOption,
+	RequestPermissionResponse,
 	SessionUpdate,
 	StopReason,
 	ToolCallContent,
@@ -48,12 +53,22 @@ import {
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.ts";
 import { formatNoModelsAvailableMessage } from "../../core/auth-guidance.ts";
+import type {
+	ExtensionAPI,
+	ExtensionUIContext,
+	InlineExtension,
+	ToolCallEvent,
+	ToolCallEventResult,
+} from "../../core/extensions/index.ts";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.ts";
 import { SessionManager } from "../../core/session-manager.ts";
 import { resolvePath } from "../../utils/paths.ts";
+import { theme } from "../interactive/theme/theme.ts";
 
 export interface AcpModeOptions {
 	sessionDir?: string;
+	/** `--approve-all`: bypass the permission gate entirely. */
+	approveAll?: boolean;
 }
 
 /** Per-session live state. ACP session id === pi session id. */
@@ -70,6 +85,12 @@ interface AcpSession {
 	skipNextUserMessage: boolean;
 	assistantMessageId: string | undefined;
 	thoughtMessageId: string | undefined;
+	/** Session-scoped allow_always/reject_always cache; shell tools keyed by first command word. */
+	alwaysDecisions: Map<string, boolean>;
+	/** Withheld `tool_execution_start` payloads awaiting a gate decision, by tool call id. */
+	pendingCards: Map<string, { toolName: string; args: unknown }>;
+	/** Abort controllers of open permission asks; `session/cancel` settles them as deny. */
+	pendingAsks: Set<AbortController>;
 }
 
 /**
@@ -80,21 +101,233 @@ export function createAcpApp(
 	initialRuntime: AgentSessionRuntime,
 	createRuntime: CreateAgentSessionRuntimeFactory,
 	options: AcpModeOptions,
-): { app: AgentApp; disposeAll: () => Promise<void> } {
+): {
+	app: AgentApp;
+	disposeAll: () => Promise<void>;
+	handleToolCall: (sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>;
+} {
 	const sessions = new Map<string, AcpSession>();
 	let initial: AgentSessionRuntime | undefined = initialRuntime;
 	const app = agent({ name: `${APP_NAME}-acp` });
+	const gateBindings = new Map<string, { state: AcpSession; client: AgentContext }>();
 
-	/** PR3 seam: bind the tool_call gate and UI context here, before first use. */
-	const setupSession = async (session: AgentSession): Promise<void> => {
-		await session.bindExtensions({ mode: "rpc" });
+	/** Tools that never ask; handled before the always-cache so past rejects cannot block reads. */
+	const ALWAYS_ALLOW: Record<string, true> = { read: true, grep: true, find: true, ls: true };
+	/** Built-in tools that always ask, regardless of annotations. */
+	const ALWAYS_ASK: Record<string, true> = { edit: true, write: true, bash: true, powershell: true };
+	const approveAll = options.approveAll === true;
+
+	/**
+	 * Permission ask helper: races the client request against an abort signal.
+	 * `$/cancel_request` is cooperative, so the request promise may never settle.
+	 */
+	const requestPermission = (
+		client: AgentContext,
+		sessionId: string,
+		request: {
+			title: string;
+			description?: string;
+			subject?: {
+				type: "tool_call";
+				toolCall: {
+					toolCallId: string;
+					name: string;
+					title: string;
+					kind: ToolKind;
+					locations: ToolCallLocation[];
+					rawInput: unknown;
+				};
+			};
+			options: PermissionOption[];
+		},
+		signal: AbortSignal,
+	): Promise<RequestPermissionResponse | undefined> => {
+		const { promise, resolve } = Promise.withResolvers<RequestPermissionResponse | undefined>();
+		if (signal.aborted) return Promise.resolve(undefined);
+		const onAbort = (): void => resolve(undefined);
+		signal.addEventListener("abort", onAbort, { once: true });
+		const done = (response: RequestPermissionResponse | undefined): void => {
+			signal.removeEventListener("abort", onAbort);
+			resolve(response);
+		};
+		void client
+			.request(methods.client.session.requestPermission, { ...request, sessionId }, { cancellationSignal: signal })
+			.then(done, () => done(undefined));
+		return promise;
+	};
+
+	/**
+	 * One session's gate entry point, reached from the inline `tool_call` hook in
+	 * main.ts. Returns undefined to let the call run, `{block:true}` to deny it.
+	 */
+	const gateToolCall = async (
+		state: AcpSession,
+		sessionId: string,
+		client: AgentContext,
+		event: ToolCallEvent,
+	): Promise<ToolCallEventResult | undefined> => {
+		const { toolCallId, toolName } = event;
+		const release = (): void => {
+			const withheld = state.pendingCards.get(toolCallId);
+			if (withheld !== undefined) {
+				state.pendingCards.delete(toolCallId);
+				emitToolCallStart(state, toolCallId, withheld.toolName, withheld.args);
+			}
+		};
+		if (approveAll || ALWAYS_ALLOW[toolName]) {
+			release();
+			return undefined;
+		}
+		const cacheKey =
+			(toolName === "bash" || toolName === "powershell") &&
+			typeof event.input === "object" &&
+			event.input !== null &&
+			"command" in event.input &&
+			typeof event.input.command === "string"
+				? `${toolName}:${event.input.command.trim().split(/\s+/, 1)[0] ?? ""}`
+				: toolName;
+		const cached = state.alwaysDecisions.get(cacheKey);
+		if (cached !== undefined) {
+			release();
+			return cached
+				? undefined
+				: { block: true, reason: `Rejected by a previous "reject always" decision for ${cacheKey}.` };
+		}
+		if (!ALWAYS_ASK[toolName]) {
+			const info = state.runtime.session.getAllTools().find((tool) => tool.name === toolName);
+			if (info?.annotations?.readOnlyHint === true && info.annotations.destructiveHint !== true) {
+				release();
+				return undefined;
+			}
+		}
+		state.emit({ sessionUpdate: "state_update", state: "requires_action" });
+		const controller = new AbortController();
+		state.pendingAsks.add(controller);
+		try {
+			const { title, kind, locations } = describeToolCall(toolName, event.input, state.runtime.cwd);
+			const response = await requestPermission(
+				client,
+				sessionId,
+				{
+					title,
+					subject: {
+						type: "tool_call",
+						toolCall: { toolCallId, name: toolName, title, kind, locations, rawInput: event.input },
+					},
+					options: [
+						{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+						{ optionId: "allow_always", name: "Allow always", kind: "allow_always" },
+						{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+						{ optionId: "reject_always", name: "Reject always", kind: "reject_always" },
+					],
+				},
+				controller.signal,
+			);
+			const optionId = response?.outcome.outcome === "selected" ? response.outcome.optionId : undefined;
+			if (optionId === "allow_once" || optionId === "allow_always") {
+				if (optionId === "allow_always") state.alwaysDecisions.set(cacheKey, true);
+				release();
+				return undefined;
+			}
+			if (optionId === "reject_always") state.alwaysDecisions.set(cacheKey, false);
+			release();
+			return {
+				block: true,
+				reason:
+					optionId === "reject_once" || optionId === "reject_always"
+						? `The user rejected the ${toolName} tool call.`
+						: `The ${toolName} tool call was not approved.`,
+			};
+		} finally {
+			state.pendingAsks.delete(controller);
+			state.emit({ sessionUpdate: "state_update", state: "running" });
+		}
+	};
+
+	const createUiContext = (state: AcpSession, sessionId: string, client: AgentContext): ExtensionUIContext => {
+		const ask = async <T>(
+			request: { title: string; description?: string; options: PermissionOption[] },
+			resolve: (response: RequestPermissionResponse | undefined) => T,
+		): Promise<T> => {
+			const controller = new AbortController();
+			state.pendingAsks.add(controller);
+			state.emit({ sessionUpdate: "state_update", state: "requires_action" });
+			try {
+				return resolve(await requestPermission(client, sessionId, request, controller.signal));
+			} finally {
+				state.pendingAsks.delete(controller);
+				state.emit({ sessionUpdate: "state_update", state: "running" });
+			}
+		};
+		return {
+			select: async (title, options) => {
+				if (options.length === 0) return undefined;
+				return ask(
+					{
+						title,
+						options: options.map((option, index) => ({ optionId: String(index), name: option, kind: "other" })),
+					},
+					(response) =>
+						response?.outcome.outcome === "selected" ? options[Number(response.outcome.optionId)] : undefined,
+				);
+			},
+			confirm: async (title, message) =>
+				ask(
+					{
+						title,
+						description: message,
+						options: [
+							{ optionId: "allow", name: "Allow", kind: "allow_once" },
+							{ optionId: "reject", name: "Reject", kind: "reject_once" },
+						],
+					},
+					(response) => response?.outcome.outcome === "selected" && response.outcome.optionId === "allow",
+				),
+			input: async () => undefined,
+			notify: (message, type) => {
+				const prefix = type === undefined || type === "info" ? "note" : type;
+				process.stderr.write(`[acp extension ${prefix}] ${message}\n`);
+			},
+			onTerminalInput: () => () => {},
+			setStatus: (key, text) => {
+				if (text !== undefined) process.stderr.write(`[acp extension status ${key}] ${text}\n`);
+			},
+			setWorkingMessage: () => {},
+			setWorkingVisible: () => {},
+			setWorkingIndicator: () => {},
+			setHiddenThinkingLabel: () => {},
+			setWidget: () => {},
+			setFooter: () => {},
+			setHeader: () => {},
+			setTitle: () => {},
+			custom: async () => undefined as never,
+			pasteToEditor: () => {},
+			setEditorText: () => {},
+			getEditorText: () => "",
+			editor: async () => undefined,
+			addAutocompleteProvider: () => {},
+			setEditorComponent: () => {},
+			getEditorComponent: () => undefined,
+			get theme() {
+				return theme;
+			},
+			getAllThemes: () => [],
+			getTheme: () => undefined,
+			setTheme: () => ({ success: false, error: "Theme switching not supported in ACP mode" }),
+			getToolsExpanded: () => false,
+			setToolsExpanded: () => {},
+		};
+	};
+
+	const setupSession = async (state: AcpSession, sessionId: string, client: AgentContext): Promise<void> => {
+		gateBindings.set(sessionId, { state, client });
+		await state.runtime.session.bindExtensions({ mode: "rpc", uiContext: createUiContext(state, sessionId, client) });
 	};
 
 	const openSession = async (runtime: AgentSessionRuntime, client: AgentContext): Promise<AcpSession> => {
 		const sessionId = runtime.session.sessionId;
 		const existing = sessions.get(sessionId);
 		if (existing !== undefined) return existing;
-		await setupSession(runtime.session);
 		const state: AcpSession = {
 			runtime,
 			emit: (update) => {
@@ -110,7 +343,11 @@ export function createAcpApp(
 			skipNextUserMessage: false,
 			assistantMessageId: undefined,
 			thoughtMessageId: undefined,
+			alwaysDecisions: new Map(),
+			pendingCards: new Map(),
+			pendingAsks: new Set(),
 		};
+		await setupSession(state, sessionId, client);
 		// PR5 seam: watch model/thinking changes here for config_option_update.
 		state.unsubscribe = runtime.session.subscribe((event) => onSessionEvent(state, event));
 		sessions.set(sessionId, state);
@@ -173,7 +410,9 @@ export function createAcpApp(
 		const state = sessions.get(sessionId);
 		if (state === undefined) return;
 		sessions.delete(sessionId);
+		gateBindings.delete(sessionId);
 		state.unsubscribe();
+		for (const controller of state.pendingAsks) controller.abort();
 		await state.runtime.session.abort();
 		await state.runtime.dispose();
 	};
@@ -216,27 +455,19 @@ export function createAcpApp(
 				return;
 			}
 			case "tool_execution_start": {
-				const { title, kind, locations } = describeToolCall(event.toolName, event.args, state.runtime.cwd);
-				state.emit({
-					sessionUpdate: "tool_call_update",
-					toolCallId: event.toolCallId,
-					name: event.toolName,
-					title,
-					kind,
-					status: "pending",
-					rawInput: event.args,
-					...(locations.length > 0 ? { locations } : {}),
-				});
-				state.emit({
-					sessionUpdate: "tool_call_update",
-					toolCallId: event.toolCallId,
-					status: "in_progress",
-				});
+				// pi fires this BEFORE the `tool_call` hook, so the card is withheld
+				// until the gate releases it; the client never sees a denied call.
+				state.pendingCards.set(event.toolCallId, { toolName: event.toolName, args: event.args });
 				return;
 			}
 			case "tool_execution_end": {
 				const status = !event.isError ? "completed" : state.cancelling ? "cancelled" : "failed";
 				const text = toolResultText(event.result);
+				// The gate releases every card it sees; a withheld card here means
+				// the gate never ran (no `tool_call` handlers), so emit it now.
+				const withheld = state.pendingCards.get(event.toolCallId);
+				state.pendingCards.delete(event.toolCallId);
+				if (withheld !== undefined) emitToolCallStart(state, event.toolCallId, withheld.toolName, withheld.args);
 				// PR4 seam: append diff content for edit/write calls here.
 				const content: ToolCallContent[] =
 					text.length > 0 ? [{ type: "content", content: { type: "text", text } }] : [];
@@ -475,6 +706,9 @@ export function createAcpApp(
 		const state = sessions.get(params.sessionId);
 		if (state === undefined) return;
 		state.cancelling = true;
+		// Settle open asks as deny first: `abort()` waits on pending `tool_call`
+		// hooks, and the SDK request never settles when the client stays silent.
+		for (const controller of state.pendingAsks) controller.abort();
 		void state.runtime.session.abort().catch((error: unknown) => {
 			console.error(`[acp] cancel failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
@@ -485,16 +719,39 @@ export function createAcpApp(
 		sessions.clear();
 		for (const state of live) {
 			state.unsubscribe();
+			for (const controller of state.pendingAsks) controller.abort();
 			await state.runtime.session.abort();
 			await state.runtime.dispose();
 		}
+		gateBindings.clear();
 		if (initial !== undefined) {
 			await initial.dispose();
 			initial = undefined;
 		}
 	};
 
-	return { app, disposeAll };
+	const handleToolCall = (sessionId: string, event: ToolCallEvent): Promise<ToolCallEventResult | undefined> => {
+		const binding = gateBindings.get(sessionId);
+		if (binding === undefined) return Promise.resolve(undefined);
+		return gateToolCall(binding.state, sessionId, binding.client, event);
+	};
+
+	return { app, disposeAll, handleToolCall };
+}
+
+function emitToolCallStart(state: AcpSession, toolCallId: string, toolName: string, args: unknown): void {
+	const { title, kind, locations } = describeToolCall(toolName, args, state.runtime.cwd);
+	state.emit({
+		sessionUpdate: "tool_call_update",
+		toolCallId,
+		name: toolName,
+		title,
+		kind,
+		status: "pending",
+		rawInput: args,
+		...(locations.length > 0 ? { locations } : {}),
+	});
+	state.emit({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress" });
 }
 
 export async function runAcpMode(
@@ -503,7 +760,8 @@ export async function runAcpMode(
 	options: AcpModeOptions,
 ): Promise<never> {
 	takeOverStdout();
-	const { app, disposeAll } = createAcpApp(initialRuntime, createRuntime, options);
+	const { app, disposeAll, handleToolCall } = createAcpApp(initialRuntime, createRuntime, options);
+	registerAcpGateHook(handleToolCall);
 	const output = new WritableStream<Uint8Array>({
 		write(chunk) {
 			writeRawStdout(new TextDecoder().decode(chunk));
@@ -522,6 +780,33 @@ export async function runAcpMode(
 	await disposeAll();
 	process.exit(0);
 }
+
+/**
+ * The live gate hook for the running ACP app, or undefined outside ACP mode or
+ * before `runAcpMode` starts. The inline extension below resolves per-session
+ * gate state through it by pi session id.
+ */
+let gateHook: ((sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>) | undefined;
+
+function registerAcpGateHook(
+	hook: (sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>,
+): void {
+	gateHook = hook;
+}
+
+/**
+ * Inline extension loaded by every runtime when `appMode === "acp"`. pi hooks
+ * `tool_call` only through extensions, so the gate rides one; it resolves its
+ * per-session binding lazily through `ctx.sessionManager`, so sessions never
+ * share approval state. Sessions the ACP app has not opened yet pass through.
+ */
+export const acpGateExtension: InlineExtension = {
+	name: "acp-gate",
+	hidden: true,
+	factory: (pi: ExtensionAPI) => {
+		pi.on("tool_call", (event, ctx) => gateHook?.(ctx.sessionManager.getSessionId(), event));
+	},
+};
 
 function assertUsableModel(session: AgentSession): void {
 	if (session.model === undefined) throw new Error(formatNoModelsAvailableMessage());

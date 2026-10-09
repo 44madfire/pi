@@ -64,7 +64,7 @@ import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/tru
 import { builtInExtensions } from "./extensions/index.ts";
 import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runAcpMode, runPrintMode, runRpcMode } from "./modes/index.ts";
+import { acpGateExtension, InteractiveMode, runAcpMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-schema.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
@@ -578,6 +578,7 @@ export async function main(args: string[], options?: MainOptions) {
 	// Commands and startup selectors can load user-authored themes before runtime creation.
 	setThemeJsonValidator(validateThemeJson);
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
+	if (parseArgs(args).mode === "acp") extensionFactories.push(acpGateExtension);
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
@@ -954,7 +955,7 @@ export async function main(args: string[], options?: MainOptions) {
 		await runRpcMode(runtime);
 	} else if (appMode === "acp") {
 		printTimings();
-		await runAcpMode(runtime, createRuntime, { sessionDir });
+		await runAcpMode(runtime, createRuntime, { approveAll: parsed.approveAll === true, sessionDir });
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
