@@ -8,7 +8,7 @@ import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../co
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
 
-export type Mode = "text" | "json" | "rpc";
+export type Mode = "text" | "json" | "rpc" | "acp";
 
 export interface Args {
 	provider?: string;
@@ -96,14 +96,14 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--mode") {
 			const mode = args[i + 1];
 			if (mode === undefined || mode.startsWith("-")) {
-				result.diagnostics.push({ type: "error", message: "--mode requires text, json, or rpc" });
+				result.diagnostics.push({ type: "error", message: "--mode requires text, json, rpc, or acp" });
 				continue;
 			}
 			i++;
-			if (mode !== "text" && mode !== "json" && mode !== "rpc") {
+			if (mode !== "text" && mode !== "json" && mode !== "rpc" && mode !== "acp") {
 				result.diagnostics.push({
 					type: "error",
-					message: `Invalid mode "${mode}". Valid values: text, json, rpc`,
+					message: `Invalid mode "${mode}". Valid values: text, json, rpc, acp`,
 				});
 				continue;
 			}
@@ -303,7 +303,7 @@ ${chalk.bold("Options:")}
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
-  --mode <mode>                  Output mode: text (default), json, or rpc
+  --mode <mode>                  Output mode: text (default), json, rpc, or acp
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
