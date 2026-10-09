@@ -27,9 +27,11 @@ import { Readable } from "node:stream";
 import type {
 	AgentApp,
 	AgentContext,
+	AvailableCommand,
 	ContentBlock,
 	PermissionOption,
 	RequestPermissionResponse,
+	SessionConfigOption,
 	SessionUpdate,
 	StopReason,
 	ToolCallContent,
@@ -44,7 +46,7 @@ import {
 	PROTOCOL_VERSION,
 	RequestError,
 } from "@agentclientprotocol/sdk/experimental/v2";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent as PiImageContent } from "@earendil-works/pi-ai/compat";
 import { APP_NAME, VERSION } from "../../config.ts";
 import type { AgentSession, AgentSessionEvent } from "../../core/agent-session.ts";
@@ -327,6 +329,82 @@ export function createAcpApp(
 		await state.runtime.session.bindExtensions({ mode: "rpc", uiContext: createUiContext(state, sessionId, client) });
 	};
 
+	const modelValueId = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
+
+	const configOptionsFor = (session: AgentSession): SessionConfigOption[] => {
+		const available = session.modelRuntime.getAvailableSnapshot();
+		const current = session.model;
+		return [
+			{
+				type: "select",
+				configId: "model",
+				name: "Model",
+				description: "Model for this session",
+				category: "model",
+				currentValue: current === undefined ? "" : modelValueId(current),
+				options: available.map((m) => ({
+					value: modelValueId(m),
+					name: m.name || m.id,
+					description: m.provider,
+				})),
+			},
+			{
+				type: "select",
+				configId: "thought_level",
+				name: "Thought level",
+				description: "Reasoning effort for the current model",
+				category: "thought_level",
+				currentValue: session.thinkingLevel,
+				options: session.getAvailableThinkingLevels().map((level) => ({ value: level, name: level })),
+			},
+		];
+	};
+
+	// The slash commands `session.prompt("/name args")` executes headlessly:
+	// extension commands (dispatched first), prompt templates, then skills as
+	// `/skill:name`. Built-in interactive commands (/model, /thinking, ...) are
+	// TUI-only and would reach the model as literal text.
+	const commandsFor = (session: AgentSession): AvailableCommand[] => {
+		const commands: AvailableCommand[] = [];
+		const seen = new Set<string>();
+		for (const command of session.extensionRunner.getRegisteredCommands()) {
+			if (seen.has(command.invocationName)) continue;
+			seen.add(command.invocationName);
+			commands.push({
+				name: command.invocationName,
+				description: command.description ?? "",
+				input: { type: "text", hint: "arguments" },
+			});
+		}
+		for (const template of session.promptTemplates) {
+			if (seen.has(template.name)) continue;
+			seen.add(template.name);
+			// Mirrors substituteArgs placeholders ($1, $@, ${N:-default}, ${@:N}).
+			const takesArgs = /\$\{(\d+|ARGUMENTS|@):-[^}]*\}|\$\{@:\d+(?::\d+)?\}|\$(ARGUMENTS|@|\d+)/.test(
+				template.content,
+			);
+			commands.push({
+				name: template.name,
+				description: template.description,
+				input: takesArgs ? { type: "text", hint: template.argumentHint ?? "arguments" } : null,
+			});
+		}
+		for (const skill of session.resourceLoader.getSkills().skills) {
+			const name = `skill:${skill.name}`;
+			if (seen.has(name)) continue;
+			seen.add(name);
+			commands.push({ name, description: skill.description, input: { type: "text", hint: "arguments" } });
+		}
+		return commands;
+	};
+
+	const configSnapshotKey = (session: AgentSession): string => {
+		const model = session.model;
+		const available = session.modelRuntime.getAvailableSnapshot().map(modelValueId).join(",");
+		const levels = session.getAvailableThinkingLevels().join(",");
+		return `${model === undefined ? "" : modelValueId(model)}\0${session.thinkingLevel}\0${levels}\0${available}`;
+	};
+
 	const openSession = async (runtime: AgentSessionRuntime, client: AgentContext): Promise<AcpSession> => {
 		const sessionId = runtime.session.sessionId;
 		const existing = sessions.get(sessionId);
@@ -351,8 +429,16 @@ export function createAcpApp(
 			pendingAsks: new Set(),
 		};
 		await setupSession(state, sessionId, client);
-		// PR5 seam: watch model/thinking changes here for config_option_update.
-		state.unsubscribe = runtime.session.subscribe((event) => onSessionEvent(state, event));
+		// setModel emits model_select on the extension bus only, so re-check a
+		// snapshot key on every session event and emit only on change.
+		let lastConfigKey = configSnapshotKey(runtime.session);
+		state.unsubscribe = runtime.session.subscribe((event) => {
+			onSessionEvent(state, event);
+			const key = configSnapshotKey(runtime.session);
+			if (key === lastConfigKey) return;
+			lastConfigKey = key;
+			state.emit({ sessionUpdate: "config_option_update", configOptions: configOptionsFor(runtime.session) });
+		});
 		sessions.set(sessionId, state);
 		return state;
 	};
@@ -643,11 +729,14 @@ export function createAcpApp(
 		capabilities: { session: { prompt: { image: {}, embeddedContext: {} } } },
 	}));
 
-	// PR5 seam: session/new returns configOptions and availableCommands here.
 	app.onRequest(methods.agent.session.new, async ({ params, client }) => {
 		try {
 			const state = await createSession(params.cwd, client);
-			return { sessionId: state.runtime.session.sessionId };
+			return {
+				sessionId: state.runtime.session.sessionId,
+				configOptions: configOptionsFor(state.runtime.session),
+				availableCommands: commandsFor(state.runtime.session),
+			};
 		} catch (error) {
 			throw RequestError.invalidParams(error instanceof Error ? error.message : String(error));
 		}
@@ -688,7 +777,6 @@ export function createAcpApp(
 		return { sessions: sessionsOut };
 	});
 
-	// PR5 seam: config/commands land here.
 	app.onRequest(methods.agent.session.resume, async ({ params, client }) => {
 		if (params.replayFrom !== undefined && params.replayFrom !== null && params.replayFrom.type !== "start") {
 			throw RequestError.invalidParams(`Unsupported replay cursor "${params.replayFrom.type}"`);
@@ -696,7 +784,10 @@ export function createAcpApp(
 		try {
 			const state = await resumeSession(params.sessionId, params.cwd, client);
 			if (params.replayFrom?.type === "start") replayHistory(state);
-			return {};
+			return {
+				configOptions: configOptionsFor(state.runtime.session),
+				availableCommands: commandsFor(state.runtime.session),
+			};
 		} catch (error) {
 			if (error instanceof RequestError) throw error;
 			throw RequestError.invalidParams(error instanceof Error ? error.message : String(error));
@@ -705,6 +796,27 @@ export function createAcpApp(
 
 	app.onRequest(methods.agent.session.close, async ({ params }) => {
 		await closeSession(params.sessionId);
+	});
+
+	app.onRequest(methods.agent.session.setConfigOption, async ({ params }) => {
+		const state = sessions.get(params.sessionId);
+		if (state === undefined) throw RequestError.invalidParams(`Unknown session "${params.sessionId}"`);
+		if (params.type !== "id") throw RequestError.invalidParams(`Unsupported config value type "${params.type}"`);
+		const session = state.runtime.session;
+		if (params.configId === "model") {
+			const model = session.modelRuntime.getAvailableSnapshot().find((m) => modelValueId(m) === params.value);
+			if (model === undefined) throw RequestError.invalidParams(`Unknown model "${params.value}"`);
+			await session.setModel(model);
+		} else if (params.configId === "thought_level") {
+			const level = params.value as ThinkingLevel;
+			if (!session.getAvailableThinkingLevels().includes(level)) {
+				throw RequestError.invalidParams(`Unknown thought level "${params.value}"`);
+			}
+			session.setThinkingLevel(level);
+		} else {
+			throw RequestError.invalidParams(`Unknown config option "${params.configId}"`);
+		}
+		return { configOptions: configOptionsFor(session) };
 	});
 
 	app.onRequest(methods.agent.session.prompt, ({ params, client }) => {
