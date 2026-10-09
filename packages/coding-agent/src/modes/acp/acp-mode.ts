@@ -9,8 +9,8 @@
  * Protocol surface (PR1 baseline):
  * - `initialize` advertises `capabilities.session`; no other capabilities yet.
  * - `session/new`, `session/list`, `session/resume`, `session/close`,
- *   `session/prompt`, `session/cancel`. `session/resume` rejects `replayFrom`
- *   until PR2 adds replay.
+ *   `session/prompt`, `session/cancel`. `session/resume` with
+ *   `replayFrom: {type: "start"}` replays the active-branch history first.
  * - One ACP prompt turn is one `session.prompt()`: `state_update` running at
  *   start, idle with a stop reason at `agent_settled`. Never end a turn on
  *   `agent_end`/`turn_end`: those fire per inner loop, `agent_settled` once.
@@ -282,6 +282,83 @@ export function createAcpApp(
 		}
 	};
 
+	/**
+	 * Replay the active-branch history as the whole-message entities the live
+	 * turns streamed. Message ids are deterministic per entry; tool calls reuse
+	 * their live ids, so a resumed client sees the same entities.
+	 */
+	const replayHistory = (state: AcpSession): void => {
+		const branch = state.runtime.session.sessionManager.getBranch();
+		// Results carry no arguments; recover each call's input from the
+		// assistant message that requested it, for titles and rawInput.
+		const toolInputs = new Map<string, unknown>();
+		for (const entry of branch) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			for (const block of entry.message.content) {
+				if (block.type === "toolCall") toolInputs.set(block.id, block.arguments);
+			}
+		}
+		for (const entry of branch) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role === "user") {
+				const content: ContentBlock[] =
+					typeof message.content === "string"
+						? [{ type: "text", text: message.content }]
+						: message.content.map((block) =>
+								block.type === "image"
+									? { type: "image", data: block.data, mimeType: block.mimeType }
+									: { type: "text", text: block.text },
+							);
+				state.emit({ sessionUpdate: "user_message", messageId: `replay-${entry.id}`, content });
+			} else if (message.role === "assistant") {
+				const text = message.content
+					.filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+					.map((block) => block.text)
+					.join("");
+				if (text.length > 0) {
+					state.emit({
+						sessionUpdate: "agent_message",
+						messageId: `replay-${entry.id}`,
+						content: [{ type: "text", text }],
+					});
+				}
+				const thinking = message.content
+					.filter((block): block is Extract<typeof block, { type: "thinking" }> => block.type === "thinking")
+					.map((block) => block.thinking)
+					.join("");
+				if (thinking.length > 0) {
+					state.emit({
+						sessionUpdate: "agent_thought",
+						messageId: `replay-${entry.id}-thought`,
+						content: [{ type: "text", text: thinking }],
+					});
+				}
+			} else if (message.role === "toolResult") {
+				const input = toolInputs.get(message.toolCallId) ?? {};
+				const { title, kind, locations } = describeToolCall(message.toolName, input, state.runtime.cwd);
+				const output = message.content
+					.filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+				const content: ToolCallContent[] =
+					output.length > 0 ? [{ type: "content", content: { type: "text", text: output } }] : [];
+				state.emit({
+					sessionUpdate: "tool_call_update",
+					toolCallId: message.toolCallId,
+					name: message.toolName,
+					title,
+					kind,
+					status: message.isError ? "failed" : "completed",
+					rawInput: input,
+					rawOutput: output,
+					...(content.length > 0 ? { content } : {}),
+					...(locations.length > 0 ? { locations } : {}),
+				});
+			}
+		}
+	};
+
 	const runTurn = async (state: AcpSession, text: string, images: PiImageContent[] | undefined): Promise<void> => {
 		state.turnActive = true;
 		state.skipNextUserMessage = true;
@@ -351,13 +428,14 @@ export function createAcpApp(
 		return { sessions: sessionsOut };
 	});
 
-	// PR2 seam: replayFrom handling lands here; PR5 adds config/commands.
+	// PR5 seam: config/commands land here.
 	app.onRequest(methods.agent.session.resume, async ({ params, client }) => {
-		if (params.replayFrom !== undefined && params.replayFrom !== null) {
-			throw RequestError.invalidParams("replayFrom is not supported yet");
+		if (params.replayFrom !== undefined && params.replayFrom !== null && params.replayFrom.type !== "start") {
+			throw RequestError.invalidParams(`Unsupported replay cursor "${params.replayFrom.type}"`);
 		}
 		try {
-			await resumeSession(params.sessionId, params.cwd, client);
+			const state = await resumeSession(params.sessionId, params.cwd, client);
+			if (params.replayFrom?.type === "start") replayHistory(state);
 			return {};
 		} catch (error) {
 			if (error instanceof RequestError) throw error;

@@ -97,6 +97,21 @@ async function waitForIdle(updates: SessionUpdate[]): Promise<StopReason | null 
 	throw new Error(`timed out waiting for idle; states: ${states(updates).join(",")}`);
 }
 
+/**
+ * Wait for `count` updates at `start` (the updates length taken before the
+ * `session/resume` call). The in-process stream may deliver already-queued
+ * replay notifies before the resume response resolves.
+ */
+async function waitForUpdates(updates: SessionUpdate[], start: number, count: number): Promise<SessionUpdate[]> {
+	for (let i = 0; i < 200 && updates.length < start + count; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	if (updates.length < start + count) {
+		throw new Error(`timed out waiting for ${count} updates; got ${updates.length - start}`);
+	}
+	return updates.slice(start, start + count);
+}
+
 describe("acp mode", () => {
 	const stops: Array<() => Promise<void>> = [];
 	afterEach(async () => {
@@ -257,7 +272,7 @@ describe("acp mode", () => {
 		expect(errors[0]?.content).toEqual([{ type: "text", text: "provider blew up" }]);
 	});
 
-	it("lists, resumes, rejects replay, and closes sessions", async () => {
+	it("lists, resumes, and closes sessions", async () => {
 		const scenario = await startScenario({ responses: [fauxAssistantMessage("hi")] });
 		stops.push(scenario.stop);
 
@@ -269,14 +284,6 @@ describe("acp mode", () => {
 			cwd: scenario.harness.tempDir,
 		});
 		expect(resumed).toEqual({});
-
-		await expect(
-			scenario.ctx.request(methods.agent.session.resume, {
-				sessionId: scenario.sessionId,
-				cwd: scenario.harness.tempDir,
-				replayFrom: { type: "start" },
-			}),
-		).rejects.toThrow();
 
 		await scenario.ctx.request(methods.agent.session.close, { sessionId: scenario.sessionId });
 		await expect(
@@ -316,5 +323,155 @@ describe("acp mode", () => {
 			(update) => update.status === "completed",
 		);
 		expect(ends).toHaveLength(1);
+	});
+});
+
+describe("acp resume replay", () => {
+	const stops: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		while (stops.length > 0) {
+			await stops.pop()?.();
+		}
+	});
+
+	it("replays text, thinking, and tool calls as the live entities, in order", async () => {
+		const echo: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "echo",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_id, params) => {
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				return { content: [{ type: "text", text: `saw ${text}` }], details: {} };
+			},
+		};
+		const scenario = await startScenario({
+			tools: [echo],
+			responses: [
+				fauxAssistantMessage(
+					[
+						fauxThinking("thinking it over"),
+						{ type: "text", text: "live text here" },
+						fauxToolCall("echo", { text: "hi" }),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("done"),
+			],
+		});
+		stops.push(scenario.stop);
+
+		await scenario.ctx.request(methods.agent.session.prompt, {
+			sessionId: scenario.sessionId,
+			prompt: [{ type: "text", text: "run it" }],
+		});
+		expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+		const live = scenario.updates.slice();
+		const replayStart = scenario.updates.length;
+		await scenario.ctx.request(methods.agent.session.resume, {
+			sessionId: scenario.sessionId,
+			cwd: scenario.harness.tempDir,
+			replayFrom: { type: "start" },
+		});
+		const replayed = await waitForUpdates(scenario.updates, replayStart, 5);
+		expect(replayed).toHaveLength(5);
+		expect(replayed.map((update) => update.sessionUpdate)).toEqual([
+			"user_message",
+			"agent_message",
+			"agent_thought",
+			"tool_call_update",
+			"agent_message",
+		]);
+
+		// Whole replayed messages carry the same content the live chunks streamed.
+		expect(filterUpdates(replayed, "user_message").map((update) => update.content)).toEqual(
+			filterUpdates(live, "user_message").map((update) => update.content),
+		);
+		const wholeText = (updates: readonly SessionUpdate[], kind: "agent_message" | "agent_thought"): string[] =>
+			filterUpdates(updates, kind).map((update) =>
+				(update.content ?? []).map((block) => (block.type === "text" ? block.text : "")).join(""),
+			);
+		const chunkedText = (
+			updates: readonly SessionUpdate[],
+			kind: "agent_message_chunk" | "agent_thought_chunk",
+		): string[] => {
+			const groups = new Map<string, string>();
+			for (const chunk of filterUpdates(updates, kind)) {
+				if (chunk.content.type !== "text") continue;
+				groups.set(chunk.messageId, (groups.get(chunk.messageId) ?? "") + chunk.content.text);
+			}
+			return [...groups.values()];
+		};
+		expect(wholeText(replayed, "agent_message")).toEqual(chunkedText(live, "agent_message_chunk"));
+		expect(wholeText(replayed, "agent_thought")).toEqual(chunkedText(live, "agent_thought_chunk"));
+
+		// The replayed card equals the live card's merged updates, under the same tool id.
+		const replayedCard = filterUpdates(replayed, "tool_call_update");
+		expect(replayedCard).toHaveLength(1);
+		expect(replayedCard[0]).toEqual(Object.assign({}, ...filterUpdates(live, "tool_call_update")));
+
+		// Replay is deterministic: a second resume emits identical updates.
+		const secondStart = scenario.updates.length;
+		await scenario.ctx.request(methods.agent.session.resume, {
+			sessionId: scenario.sessionId,
+			cwd: scenario.harness.tempDir,
+			replayFrom: { type: "start" },
+		});
+		expect(await waitForUpdates(scenario.updates, secondStart, 5)).toEqual(replayed);
+	});
+
+	it("replays a failing tool as failed", async () => {
+		const boom: AgentTool = {
+			name: "boom",
+			label: "Boom",
+			description: "boom",
+			parameters: Type.Object({}),
+			execute: async () => {
+				throw new Error("kaput");
+			},
+		};
+		const scenario = await startScenario({
+			tools: [boom],
+			responses: [
+				fauxAssistantMessage([fauxToolCall("boom", {})], { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			],
+		});
+		stops.push(scenario.stop);
+
+		await scenario.ctx.request(methods.agent.session.prompt, {
+			sessionId: scenario.sessionId,
+			prompt: [{ type: "text", text: "run it" }],
+		});
+		expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+		const live = scenario.updates.slice();
+		const replayStart = scenario.updates.length;
+		await scenario.ctx.request(methods.agent.session.resume, {
+			sessionId: scenario.sessionId,
+			cwd: scenario.harness.tempDir,
+			replayFrom: { type: "start" },
+		});
+		const replayed = await waitForUpdates(scenario.updates, replayStart, 3);
+		expect(replayed.map((update) => update.sessionUpdate)).toEqual([
+			"user_message",
+			"tool_call_update",
+			"agent_message",
+		]);
+		const replayedCard = filterUpdates(replayed, "tool_call_update");
+		expect(replayedCard).toHaveLength(1);
+		expect(replayedCard[0]?.status).toBe("failed");
+		expect(replayedCard[0]).toEqual(Object.assign({}, ...filterUpdates(live, "tool_call_update")));
+	});
+
+	it("rejects unknown replay cursors", async () => {
+		const scenario = await startScenario({ responses: [] });
+		stops.push(scenario.stop);
+		await expect(
+			scenario.ctx.request(methods.agent.session.resume, {
+				sessionId: scenario.sessionId,
+				cwd: scenario.harness.tempDir,
+				replayFrom: { type: "_custom" },
+			}),
+		).rejects.toThrow();
 	});
 });
