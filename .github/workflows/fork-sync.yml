@@ -1,0 +1,163 @@
+# Fork-only infrastructure: keeps acp-mode rebased onto a mirrored main.
+# This file must never be merged upstream.
+#
+# Required repository secret: FORK_SYNC_TOKEN, a fine-grained PAT scoped to
+# this repo with Contents, Workflows, and Issues read/write. The default
+# GITHUB_TOKEN cannot push commits that touch .github/workflows/* (which
+# upstream commits regularly do), so it cannot be used here. Per current
+# GitHub docs, POST merge-upstream itself needs only Contents:write; the
+# Workflows permission is needed for the git push in "Push rebased acp-mode".
+name: fork-sync
+
+on:
+  schedule:
+    # Daily. Scheduled runs use the default branch (acp-mode).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# GITHUB_TOKEN is entirely unused: every API call and push authenticates
+# with FORK_SYNC_TOKEN instead.
+permissions: {}
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check FORK_SYNC_TOKEN secret
+        id: secret
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [ -z "$FORK_SYNC_TOKEN" ]; then
+            echo "::error::Missing repository secret FORK_SYNC_TOKEN. Create a fine-grained PAT with Contents, Workflows, and Issues read/write on this repo and store it with: gh secret set FORK_SYNC_TOKEN -R 44madfire/pi"
+            exit 1
+          fi
+          echo "FORK_SYNC_TOKEN is set."
+
+      - name: Sync main from upstream
+        id: sync
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          http_code=$(curl -s -o merge-upstream.json -w '%{http_code}' -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $FORK_SYNC_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/44madfire/pi/merge-upstream \
+            -d '{"branch":"main"}')
+          cat merge-upstream.json
+          echo
+          if [ "$http_code" = "409" ]; then
+            echo "::error::merge-upstream returned 409: main cannot be synced (merge conflict). acp-mode left untouched."
+            exit 1
+          elif [ "$http_code" != "200" ]; then
+            echo "::error::merge-upstream failed with HTTP $http_code. acp-mode left untouched."
+            exit 1
+          fi
+
+      - name: Checkout acp-mode
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: acp-mode
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
+      - name: Rebase acp-mode onto origin/main
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "pre_rebase_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git fetch origin main
+          if ! git rebase origin/main; then
+            git rebase --abort || true
+            echo "::error::Rebase of acp-mode onto origin/main conflicted. Remote acp-mode left untouched."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        id: setup-node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system dependencies
+        id: sysdeps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        id: install
+        run: npm ci --ignore-scripts
+
+      - name: Check
+        id: check
+        run: npm run check
+
+      - name: Push rebased acp-mode
+        id: push
+        run: |
+          git push --force-with-lease=acp-mode:${{ steps.rebase.outputs.pre_rebase_sha }} origin acp-mode
+
+      - name: Report failure
+        id: report
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          SECRET_OUTCOME: ${{ steps.secret.outcome }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          REBASE_OUTCOME: ${{ steps.rebase.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup-node.outcome }}
+          SYSDEPS_OUTCOME: ${{ steps.sysdeps.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "FORK_SYNC_TOKEN is missing, so no issue can be filed. See the 'Check FORK_SYNC_TOKEN secret' step above."
+            exit 0
+          fi
+          failing="unknown step (see run logs)"
+          if [ "$SECRET_OUTCOME" = "failure" ]; then
+            failing="Check FORK_SYNC_TOKEN secret"
+          elif [ "$SYNC_OUTCOME" = "failure" ]; then
+            failing="Sync main from upstream"
+          elif [ "$CHECKOUT_OUTCOME" = "failure" ]; then
+            failing="Checkout acp-mode"
+          elif [ "$REBASE_OUTCOME" = "failure" ]; then
+            failing="Rebase acp-mode onto origin/main"
+          elif [ "$SETUP_NODE_OUTCOME" = "failure" ]; then
+            failing="Setup Node.js"
+          elif [ "$SYSDEPS_OUTCOME" = "failure" ]; then
+            failing="Install system dependencies"
+          elif [ "$INSTALL_OUTCOME" = "failure" ]; then
+            failing="Install dependencies"
+          elif [ "$CHECK_OUTCOME" = "failure" ]; then
+            failing="Check (npm run check)"
+          elif [ "$PUSH_OUTCOME" = "failure" ]; then
+            failing="Push rebased acp-mode"
+          fi
+          body="fork-sync failed in step: **$failing**. acp-mode was left untouched.
+          Run: $RUN_URL"
+          issue_json=$(gh issue list -R 44madfire/pi --state all --limit 100 --json number,title,state \
+            --jq '[.[] | select(.title == "fork-sync failure")][0] // empty')
+          number=$(echo "$issue_json" | jq -r '.number // empty')
+          if [ -z "$number" ]; then
+            gh issue create -R 44madfire/pi --title "fork-sync failure" --body "$body"
+          else
+            state=$(echo "$issue_json" | jq -r '.state')
+            if [ "$state" = "CLOSED" ]; then
+              gh issue reopen -R 44madfire/pi "$number"
+            fi
+            gh issue comment -R 44madfire/pi "$number" --body "$body"
+          fi
