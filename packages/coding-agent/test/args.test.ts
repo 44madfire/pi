@@ -155,7 +155,7 @@ describe("parseArgs", () => {
 
 	// Issue #9045
 	describe("--mode flag", () => {
-		test.each(["text", "json", "rpc"] as const)("parses --mode %s", (mode) => {
+		test.each(["text", "json", "rpc", "acp"] as const)("parses --mode %s", (mode) => {
 			const result = parseArgs(["--mode", mode]);
 			expect(result.mode).toBe(mode);
 			expect(result.diagnostics).toEqual([]);
@@ -168,7 +168,7 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual([]);
 			expect(result.unknownFlags.size).toBe(0);
 			expect(result.diagnostics).toEqual([
-				{ type: "error", message: `Invalid mode "${mode}". Valid values: text, json, rpc` },
+				{ type: "error", message: `Invalid mode "${mode}". Valid values: text, json, rpc, acp` },
 			]);
 		});
 
@@ -176,7 +176,7 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--mode"]);
 			expect(result.mode).toBeUndefined();
 			expect(result.unknownFlags.size).toBe(0);
-			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, or rpc" }]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, rpc, or acp" }]);
 		});
 
 		test("does not consume another option as a --mode value", () => {
@@ -184,13 +184,13 @@ describe("parseArgs", () => {
 			expect(result.mode).toBeUndefined();
 			expect(result.version).toBe(true);
 			expect(result.unknownFlags.size).toBe(0);
-			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, or rpc" }]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, rpc, or acp" }]);
 		});
 
 		test("reports an invalid --mode value after a valid one", () => {
 			const result = parseArgs(["--mode", "json", "--mode", "yaml"]);
 			expect(result.diagnostics).toEqual([
-				{ type: "error", message: 'Invalid mode "yaml". Valid values: text, json, rpc' },
+				{ type: "error", message: 'Invalid mode "yaml". Valid values: text, json, rpc, acp' },
 			]);
 		});
 	});
