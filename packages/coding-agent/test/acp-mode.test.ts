@@ -3,6 +3,8 @@
  * over a direct connection, asserting on the `session/update` stream.
  */
 
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type {
 	ClientContext,
 	RequestPermissionRequest,
@@ -10,9 +12,10 @@ import type {
 	SessionUpdate,
 	StopReason,
 } from "@agentclientprotocol/sdk/experimental/v2";
-import { client, methods, PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2";
+import { client, methods, PROTOCOL_VERSION, ToolCallContent } from "@agentclientprotocol/sdk/experimental/v2";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/compat";
+import { applyPatch } from "diff";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.ts";
@@ -564,6 +567,108 @@ describe("acp mode", () => {
 			expect(permissionRequests).toHaveLength(0);
 			const card = filterUpdates(scenario.updates, "tool_call_update");
 			expect(card.map((update) => update.status)).toEqual(["pending", "in_progress", "completed"]);
+		});
+	});
+
+	describe("edit/write diffs", () => {
+		it("attaches a modify change with a valid git_patch to a successful edit", async () => {
+			const scenario = await startScenario({
+				approveAll: true,
+				responses: [
+					fauxAssistantMessage(
+						[fauxToolCall("edit", { path: "note.txt", edits: [{ oldText: "original", newText: "CHANGED" }] })],
+						{ stopReason: "toolUse" },
+					),
+					fauxAssistantMessage("done"),
+				],
+			});
+			stops.push(scenario.stop);
+			writeFileSync(join(scenario.harness.tempDir, "note.txt"), "original\n");
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "edit it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+
+			const ends = filterUpdates(scenario.updates, "tool_call_update").filter(
+				(update) => update.status === "completed",
+			);
+			expect(ends).toHaveLength(1);
+			const end = ends[0];
+			expect(end?.content).toHaveLength(2);
+			const diff = end?.content?.find((item) => ToolCallContent.isDiff(item));
+			if (diff === undefined || !ToolCallContent.isDiff(diff)) throw new Error("expected diff content");
+			expect(diff.changes).toEqual([{ operation: "modify", path: join(scenario.harness.tempDir, "note.txt") }]);
+			expect(diff.patch?.format).toBe("git_patch");
+			const patch = diff.patch?.text ?? "";
+			expect(patch.startsWith("diff --git")).toBe(true);
+			expect(applyPatch("original\n", patch)).toBe("CHANGED\n");
+		});
+
+		it("reports write as add for new files and modify for existing ones, without a patch", async () => {
+			const scenario = await startScenario({
+				approveAll: true,
+				responses: [
+					fauxAssistantMessage([fauxToolCall("write", { path: "new.txt", content: "one\n" })], {
+						stopReason: "toolUse",
+					}),
+					fauxAssistantMessage([fauxToolCall("write", { path: "new.txt", content: "two\n" })], {
+						stopReason: "toolUse",
+					}),
+					fauxAssistantMessage("done"),
+				],
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "write it twice" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+
+			const target = join(scenario.harness.tempDir, "new.txt");
+			const ends = filterUpdates(scenario.updates, "tool_call_update").filter(
+				(update) => update.status === "completed",
+			);
+			expect(ends).toHaveLength(2);
+			const diffs = ends.map((end) => end.content?.find((item) => ToolCallContent.isDiff(item)));
+			const [first, second] = diffs;
+			if (first === undefined || second === undefined) throw new Error("expected diff content");
+			if (!ToolCallContent.isDiff(first) || !ToolCallContent.isDiff(second)) {
+				throw new Error("expected diff content");
+			}
+			expect(first.changes).toEqual([{ operation: "add", path: target }]);
+			expect(first.patch).toBeUndefined();
+			expect(second.changes).toEqual([{ operation: "modify", path: target }]);
+			expect(second.patch).toBeUndefined();
+		});
+
+		it("carries no diff on a failed edit", async () => {
+			const scenario = await startScenario({
+				approveAll: true,
+				responses: [
+					fauxAssistantMessage(
+						[fauxToolCall("edit", { path: "note.txt", edits: [{ oldText: "missing", newText: "x" }] })],
+						{ stopReason: "toolUse" },
+					),
+					fauxAssistantMessage("done"),
+				],
+			});
+			stops.push(scenario.stop);
+			writeFileSync(join(scenario.harness.tempDir, "note.txt"), "original\n");
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "edit it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+
+			const ends = filterUpdates(scenario.updates, "tool_call_update").filter(
+				(update) => update.status === "failed",
+			);
+			expect(ends).toHaveLength(1);
+			expect(ends[0]?.content?.some((item) => item.type === "diff")).toBe(false);
 		});
 	});
 });

@@ -22,6 +22,7 @@
  *   gate decides. `--approve-all` bypasses the gate.
  */
 
+import { existsSync } from "node:fs";
 import { Readable } from "node:stream";
 import type {
 	AgentApp,
@@ -107,6 +108,8 @@ export function createAcpApp(
 	handleToolCall: (sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>;
 } {
 	const sessions = new Map<string, AcpSession>();
+	/** Edit/write targets recorded at `tool_execution_start`, for diff content at end. */
+	const pendingFiles = new Map<string, { path: string; existed: boolean }>();
 	let initial: AgentSessionRuntime | undefined = initialRuntime;
 	const app = agent({ name: `${APP_NAME}-acp` });
 	const gateBindings = new Map<string, { state: AcpSession; client: AgentContext }>();
@@ -455,6 +458,13 @@ export function createAcpApp(
 				return;
 			}
 			case "tool_execution_start": {
+				if (event.toolName === "edit" || event.toolName === "write") {
+					const path = stringField(event.args, "path");
+					if (path !== undefined) {
+						const absolute = resolvePath(path, state.runtime.cwd);
+						pendingFiles.set(event.toolCallId, { path: absolute, existed: existsSync(absolute) });
+					}
+				}
 				// pi fires this BEFORE the `tool_call` hook, so the card is withheld
 				// until the gate releases it; the client never sees a denied call.
 				state.pendingCards.set(event.toolCallId, { toolName: event.toolName, args: event.args });
@@ -468,9 +478,28 @@ export function createAcpApp(
 				const withheld = state.pendingCards.get(event.toolCallId);
 				state.pendingCards.delete(event.toolCallId);
 				if (withheld !== undefined) emitToolCallStart(state, event.toolCallId, withheld.toolName, withheld.args);
-				// PR4 seam: append diff content for edit/write calls here.
+				const pending = pendingFiles.get(event.toolCallId);
+				pendingFiles.delete(event.toolCallId);
 				const content: ToolCallContent[] =
 					text.length > 0 ? [{ type: "content", content: { type: "text", text } }] : [];
+				if (!event.isError && pending !== undefined) {
+					// Edit's `details.patch` carries `---`/`+++` headers but no `diff --git` line.
+					const patch = event.toolName === "edit" ? detailsPatchOf(event.result) : undefined;
+					const header = patch?.match(/^--- (.+)$/m)?.[1];
+					if (event.toolName === "write" && !pending.existed) {
+						content.push({ type: "diff", changes: [{ operation: "add", path: pending.path }] });
+					} else {
+						content.push({
+							type: "diff",
+							changes: [{ operation: "modify", path: pending.path }],
+							...(header === undefined || patch === undefined
+								? {}
+								: {
+										patch: { format: "git_patch", text: `diff --git a/${header} b/${header}\n${patch}` },
+									}),
+						});
+					}
+				}
 				state.emit({
 					sessionUpdate: "tool_call_update",
 					toolCallId: event.toolCallId,
@@ -856,6 +885,14 @@ function toolResultText(result: unknown): string {
 		parts.push(block.text);
 	}
 	return parts.join("\n");
+}
+
+function detailsPatchOf(result: unknown): string | undefined {
+	if (typeof result !== "object" || result === null || !("details" in result)) return undefined;
+	const details = result.details;
+	if (typeof details !== "object" || details === null || !("patch" in details)) return undefined;
+	const patch = details.patch;
+	return typeof patch === "string" && patch.length > 0 ? patch : undefined;
 }
 
 function promptToText(prompt: readonly ContentBlock[]): { text: string; images: PiImageContent[] } {
