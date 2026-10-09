@@ -51,6 +51,7 @@ export interface Args {
 	tuiMode?: TuiMode;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
+	approveAll?: boolean;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -244,6 +245,8 @@ export function parseArgs(args: string[]): Args {
 			result.projectTrustOverride = false;
 		} else if (arg === "--offline") {
 			result.offline = true;
+		} else if (arg === "--approve-all") {
+			result.approveAll = true;
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
 		} else if (arg.startsWith("--")) {
@@ -341,7 +344,7 @@ ${chalk.bold("Options:")}
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
-  --                             End option parsing; treat remaining arguments as messages/files
+  --approve-all                  Approve all tool calls without prompting (ACP mode)
   --help, -h                     Show this help
   --version, -v                  Show version number
 

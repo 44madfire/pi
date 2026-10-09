@@ -3,14 +3,21 @@
  * over a direct connection, asserting on the `session/update` stream.
  */
 
-import type { ClientContext, SessionUpdate, StopReason } from "@agentclientprotocol/sdk/experimental/v2";
+import type {
+	ClientContext,
+	RequestPermissionRequest,
+	RequestPermissionResponse,
+	SessionUpdate,
+	StopReason,
+} from "@agentclientprotocol/sdk/experimental/v2";
 import { client, methods, PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.ts";
 import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { ToolCallEvent, ToolCallEventResult } from "../src/core/extensions/index.ts";
 import { createAcpApp } from "../src/modes/acp/acp-mode.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
 
@@ -41,8 +48,23 @@ interface Scenario {
 async function startScenario(options: {
 	responses: Parameters<Harness["setResponses"]>[0];
 	tools?: AgentTool[];
+	approveAll?: boolean;
+	onPermission?: (request: RequestPermissionRequest) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
+	permissionRequests?: RequestPermissionRequest[];
 }): Promise<Scenario> {
-	const harness = await createHarness({ tools: options.tools });
+	let gateHook: ((sessionId: string, event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>) | undefined;
+	const harness = await createHarness({
+		tools: options.tools,
+		extensionFactories: [
+			{
+				name: "acp-gate-test",
+				hidden: true,
+				factory: (pi) => {
+					pi.on("tool_call", (event, ctx) => gateHook?.(ctx.sessionManager.getSessionId(), event));
+				},
+			},
+		],
+	});
 	harness.setResponses(options.responses);
 	const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
 		throw new Error("tests create no extra runtimes");
@@ -59,11 +81,20 @@ async function startScenario(options: {
 		},
 		createRuntime,
 	);
-	const { app, disposeAll } = createAcpApp(initialRuntime, createRuntime, {});
-	const updates: SessionUpdate[] = [];
-	const clientApp = client({ name: "acp-mode-test" }).onNotification(methods.client.session.update, ({ params }) => {
-		updates.push(params.update);
+	const { app, disposeAll, handleToolCall } = createAcpApp(initialRuntime, createRuntime, {
+		...(options.approveAll === true ? { approveAll: true } : {}),
 	});
+	gateHook = handleToolCall;
+	const updates: SessionUpdate[] = [];
+	const clientApp = client({ name: "acp-mode-test" })
+		.onNotification(methods.client.session.update, ({ params }) => {
+			updates.push(params.update);
+		})
+		.onRequest(methods.client.session.requestPermission, ({ params }) => {
+			options.permissionRequests?.push(params);
+			if (options.onPermission !== undefined) return options.onPermission(params);
+			return { outcome: { outcome: "selected", optionId: "allow_once" } };
+		});
 	const connection = clientApp.connect(app);
 	const ctx = connection.agent;
 	const initializeResponse = await ctx.request(methods.agent.initialize, {
@@ -323,6 +354,217 @@ describe("acp mode", () => {
 			(update) => update.status === "completed",
 		);
 		expect(ends).toHaveLength(1);
+	});
+
+	describe("tool approvals", () => {
+		const scriptedTool = (name: string, text: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}, { additionalProperties: true }),
+			execute: async () => ({ content: [{ type: "text", text }], details: {} }),
+		});
+
+		const selected = (optionId: string): RequestPermissionResponse => ({
+			outcome: { outcome: "selected", optionId },
+		});
+
+		it("asks once for a gated tool, shows the card only after approval, then completes", async () => {
+			const permissionRequests: RequestPermissionRequest[] = [];
+			const seenCardBeforeAnswer = { value: false };
+			const scenario = await startScenario({
+				tools: [scriptedTool("bash", "ran it")],
+				responses: [
+					fauxAssistantMessage([fauxToolCall("bash", { command: "echo hi" })], { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				],
+				permissionRequests,
+				onPermission: () => {
+					seenCardBeforeAnswer.value = filterUpdates(scenario.updates, "tool_call_update").length > 0;
+					return selected("allow_once");
+				},
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "run it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+
+			expect(permissionRequests).toHaveLength(1);
+			expect(permissionRequests[0]?.options.map((option) => option.optionId)).toEqual([
+				"allow_once",
+				"allow_always",
+				"reject_once",
+				"reject_always",
+			]);
+			expect(permissionRequests[0]?.subject?.type).toBe("tool_call");
+			expect(seenCardBeforeAnswer.value).toBe(false);
+			expect(states(scenario.updates)).toContain("requires_action");
+			const card = filterUpdates(scenario.updates, "tool_call_update");
+			expect(card.map((update) => update.status)).toEqual(["pending", "in_progress", "completed"]);
+			expect(card[0]).toMatchObject({ name: "bash", rawInput: { command: "echo hi" } });
+		});
+
+		it("allow_always skips the second ask for the same first command word", async () => {
+			const permissionRequests: RequestPermissionRequest[] = [];
+			const scenario = await startScenario({
+				tools: [scriptedTool("bash", "ok")],
+				responses: [
+					fauxAssistantMessage(
+						[fauxToolCall("bash", { command: "git status" }), fauxToolCall("bash", { command: "git diff" })],
+						{ stopReason: "toolUse" },
+					),
+					fauxAssistantMessage("done"),
+				],
+				permissionRequests,
+				onPermission: (request) => {
+					const subject = request.subject;
+					const toolCall =
+						subject !== null && subject !== undefined && subject.type === "tool_call" && "toolCall" in subject
+							? subject.toolCall
+							: undefined;
+					const rawInput =
+						typeof toolCall === "object" && toolCall !== null && "rawInput" in toolCall
+							? toolCall.rawInput
+							: undefined;
+					const command =
+						typeof rawInput === "object" && rawInput !== null && "command" in rawInput
+							? String(rawInput.command)
+							: "";
+					return selected(command === "git status" ? "allow_always" : "allow_once");
+				},
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "run both" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+			expect(permissionRequests).toHaveLength(1);
+		});
+
+		it("reject fails the card and shows the model the reason", async () => {
+			const scenario = await startScenario({
+				tools: [scriptedTool("edit", "never runs")],
+				responses: [
+					fauxAssistantMessage([fauxToolCall("edit", { path: "a.txt" })], { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				],
+				onPermission: () => selected("reject_once"),
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "edit it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+
+			const card = filterUpdates(scenario.updates, "tool_call_update");
+			expect(card.map((update) => update.status)).toEqual(["pending", "in_progress", "failed"]);
+			expect(card.at(-1)?.rawOutput).toContain("rejected");
+			const result = scenario.harness.session.messages.findLast(
+				(message) => message.role === "toolResult" && message.toolName === "edit",
+			);
+			expect(result?.role).toBe("toolResult");
+			if (result?.role === "toolResult")
+				expect(result.content.map((block) => (block.type === "text" ? block.text : "")).join("")).toContain(
+					"rejected",
+				);
+		});
+
+		it("does not ask for read tools", async () => {
+			const permissionRequests: RequestPermissionRequest[] = [];
+			const scenario = await startScenario({
+				tools: [scriptedTool("read", "file contents")],
+				responses: [
+					fauxAssistantMessage([fauxToolCall("read", { path: "a.txt" })], { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				],
+				permissionRequests,
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "read it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+			expect(permissionRequests).toHaveLength(0);
+			expect(states(scenario.updates)).not.toContain("requires_action");
+		});
+
+		it("cancel while asking settles promptly as cancelled", async () => {
+			const { promise: askOpened, resolve: markAskOpened } = Promise.withResolvers<void>();
+			const scenario = await startScenario({
+				tools: [scriptedTool("bash", "never runs")],
+				responses: [
+					fauxAssistantMessage([fauxToolCall("bash", { command: "sleep 60" })], { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				],
+				onPermission: () => {
+					markAskOpened();
+					return new Promise<RequestPermissionResponse>(() => {});
+				},
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "hang" }],
+			});
+			await askOpened;
+			await scenario.ctx.notify(methods.agent.session.cancel, { sessionId: scenario.sessionId });
+			expect(await waitForIdle(scenario.updates)).toBe("cancelled");
+		});
+
+		it("answers an extension select through request_permission", async () => {
+			const permissionRequests: RequestPermissionRequest[] = [];
+			const scenario = await startScenario({
+				responses: [fauxAssistantMessage("done")],
+				permissionRequests,
+				onPermission: (request) => {
+					const option = request.options.find((candidate) => candidate.name === "beta");
+					return selected(option?.optionId ?? "0");
+				},
+			});
+			stops.push(scenario.stop);
+
+			const ui = scenario.harness.session.extensionRunner.getUIContext();
+			const pending = ui.select("Pick one", ["alpha", "beta"]);
+			await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
+			expect(permissionRequests[0]?.options).toEqual([
+				{ optionId: "0", name: "alpha", kind: "other" },
+				{ optionId: "1", name: "beta", kind: "other" },
+			]);
+			await expect(pending).resolves.toBe("beta");
+		});
+
+		it("--approve-all skips asks", async () => {
+			const permissionRequests: RequestPermissionRequest[] = [];
+			const scenario = await startScenario({
+				tools: [scriptedTool("bash", "ran free")],
+				responses: [
+					fauxAssistantMessage([fauxToolCall("bash", { command: "rm -rf x" })], { stopReason: "toolUse" }),
+					fauxAssistantMessage("done"),
+				],
+				approveAll: true,
+				permissionRequests,
+			});
+			stops.push(scenario.stop);
+
+			await scenario.ctx.request(methods.agent.session.prompt, {
+				sessionId: scenario.sessionId,
+				prompt: [{ type: "text", text: "run it" }],
+			});
+			expect(await waitForIdle(scenario.updates)).toBe("end_turn");
+			expect(permissionRequests).toHaveLength(0);
+			const card = filterUpdates(scenario.updates, "tool_call_update");
+			expect(card.map((update) => update.status)).toEqual(["pending", "in_progress", "completed"]);
+		});
 	});
 });
 

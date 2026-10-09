@@ -409,6 +409,13 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--approve-all flag", () => {
+		test("parses --approve-all flag", () => {
+			const result = parseArgs(["--approve-all"]);
+			expect(result.approveAll).toBe(true);
+		});
+	});
+
 	describe("--tui-mode flag", () => {
 		test.each(["regular", "fullscreen"] as const)("parses %s mode", (mode) => {
 			const result = parseArgs(["--tui-mode", mode]);
